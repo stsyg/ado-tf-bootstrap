@@ -1,0 +1,36 @@
+# Getting started
+
+The bootstrap created the repository, the pipelines and the Azure side. Nothing has run yet: the
+starter files were committed with `[skip ci]`.
+
+## 1. Check the pipelines
+
+In Azure DevOps, project **${project_reference}**, Pipelines:
+
+- `01 ${pipeline_display_name} Continuous Integration` - run it once by hand on `main`. It should pass, and its
+  **Extensions** tab should show "No changes. Infrastructure matches the configuration."
+- `02 ${pipeline_display_name} Continuous Delivery` - run it once. The plan is empty, so the **Apply** stage is skipped.
+
+If a run stops with "needs permission to use ...", the pipeline was not yet authorised for that
+resource: that is a bootstrap fault, not something to approve by hand - tell whoever ran the
+bootstrap.
+
+## 2. Make a first change
+
+```pwsh
+git clone ${organization_url}/${replace(project_reference, " ", "%20")}/_git/${repository_name}
+cd ${repository_name}
+git switch -c first-resource
+```
+
+Uncomment the example resource group in `main.tf`, commit, push, and open a pull request into
+`main`. The CI run's **Extensions** tab shows `1 to add`. Complete the pull request (squash). The CD
+run plans, asks the approvers, and applies.
+
+## 3. Lock the provider versions
+
+After your first local `terraform init`, commit `.terraform.lock.hcl`.
+
+## Who approves
+
+Approvers are the members of the Azure DevOps group `${approvers_group}`: %{ if length(approvers) + length(approver_groups) == 0 }**none - the bootstrap was run with no approvers, so an apply is not held for approval.**%{ else }%{ if length(approvers) > 0 }${join(", ", approvers)}%{ endif }%{ if length(approvers) > 0 && length(approver_groups) > 0 }, and %{ endif }%{ if length(approver_groups) > 0 }the members of the Entra group(s) ${join(", ", approver_groups)}%{ endif }.%{ endif }

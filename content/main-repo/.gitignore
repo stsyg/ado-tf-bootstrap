@@ -1,0 +1,24 @@
+# Terraform working files and local state never belong in git.
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# terraform.tfvars is committed on purpose (no secrets in it). Anything that holds a secret is not.
+*.secret.tfvars
+*.secrets.auto.tfvars
+
+# Editors and operating systems.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

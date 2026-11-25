@@ -1,0 +1,56 @@
+# ${pipeline_display_name}
+
+Terraform for **${pipeline_display_name}**, deployed from Azure DevOps project **${project_reference}** into
+Azure subscription `${subscription_id}` (region `${azure_location}`).
+
+This repository was created by `project-bootstrap`. Everything an infrastructure change needs is
+already in place: a remote state, two pipelines, a read-only identity that plans, a separate identity
+that applies, and an approval before anything is applied.
+
+## Layout
+
+| Path | What it is |
+| --- | --- |
+| `terraform.tf`, `providers.tf` | Terraform and provider versions; the `azurerm` backend (state in Azure Storage, opened with the pipeline identity's token). |
+| `variables.tf`, `terraform.tfvars` | Inputs. `terraform.tfvars` holds the values the bootstrap was given - **no secrets**. |
+| `main.tf`, `outputs.tf` | The configuration. Empty to begin with. |
+| `modules/` | Local modules, when `main.tf` grows past one page. |
+| `.pipelines/ci.yaml`, `.pipelines/cd.yaml` | The two pipelines. They only name the resources and extend the templates in `${templates_repository}`. |
+| `docs/` | How the pipelines work, how to start, how to operate. |
+
+## How a change reaches Azure
+
+1. Create a branch, change the code, open a **pull request** into `main`.
+2. **`01 ${pipeline_display_name} Continuous Integration`** runs on the pull request: format check, `validate`, and a
+   **plan** against the real state. The plan is on the run's **Extensions** tab as a card - counts,
+   destructive actions first, output changes, the files changed, the full redacted plan. The pull
+   request cannot complete until this run passes.
+3. After the squash merge, **`02 ${pipeline_display_name} Continuous Delivery`** runs on `main`: plan again.
+   - **No changes:** the apply stage is skipped. Nobody is asked for anything.
+   - **Changes:** the apply stage waits for the approvers (group `${approvers_group}`); once approved,
+     it applies **the plan file that was just shown**, not whatever `main` holds later.
+
+`main` is protected: no direct pushes, squash merge only.
+
+## Working locally
+
+The state is reachable only the way the pipelines reach it. To plan on your own machine, sign in with
+`az login` as someone who may read the state and run:
+
+```pwsh
+terraform init -backend-config="resource_group_name=<resource group>" `
+               -backend-config="storage_account_name=<storage account>" `
+               -backend-config="container_name=<container>" `
+               -backend-config="key=terraform.tfstate"
+terraform plan
+```
+
+The three names are in the variable group `${variable_group_name}` of the Azure DevOps project. If the
+bootstrap put the storage account behind a private endpoint, a workstation outside the network
+cannot reach it: use the pull request's plan instead. Do not `apply` from a workstation.
+
+Commit `.terraform.lock.hcl` after the first `terraform init` so the pipelines use the same provider
+builds you tested with.
+
+See [docs/getting-started.md](docs/getting-started.md) for the first steps and
+[docs/operations.md](docs/operations.md) for the rest.

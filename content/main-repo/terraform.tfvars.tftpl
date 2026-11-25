@@ -1,0 +1,11 @@
+# Written by project-bootstrap from the answers it was given. No secrets belong in this file: a
+# secret reaches Terraform as a TF_VAR_ pipeline variable from a variable group or Key Vault.
+subscription_id = "${subscription_id}"
+project         = "${project_name}"
+environment     = "${environment_name}"
+location        = "${azure_location}"
+tags = {
+%{ for key, value in tags ~}
+  ${jsonencode(key)} = ${jsonencode(value)}
+%{ endfor ~}
+}

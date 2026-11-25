@@ -1,0 +1,11 @@
+# A run's own folder: answers, variables, outputs and the bootstrap's state. Never committed here.
+output/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.plan
+# Your own answers file: copy answers.example.psd1 to answers.psd1 and fill it in.
+answers.psd1
+crash.log
+crash.*.log

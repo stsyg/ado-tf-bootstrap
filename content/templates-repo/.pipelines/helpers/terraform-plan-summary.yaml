@@ -1,0 +1,299 @@
+---
+# Renders the plan into the run's summary so a reviewer can read what will change in Azure without
+# scrolling the log, and publishes the redacted text plan as an artifact.
+#
+# plan.json is built and deleted inside this job. It is NEVER published: terraform show -json does
+# not redact sensitive values - it emits them under "after" and merely flags them in
+# "after_sensitive" - whereas terraform show (text) prints "(sensitive value)". The renderer below
+# reads only address, type, actions and action_reason from the JSON - from resource_changes and
+# resource_drift - and the NAMES and actions of output_changes. It never reads a value.
+#
+# The renderer is inline rather than a sibling .ps1 on purpose. This template is consumed from a
+# separate repository that is never checked out at run time, so a script file would not exist on
+# the agent. It reads its inputs from environment variables only, so tests/Test-PlanSummaryRenderer.ps1
+# in the bootstrap kit lifts it out between the markers and runs it unchanged.
+parameters:
+  - name: stage_label
+    default: 'Terraform'
+  - name: artifact_name
+    default: 'plan'
+  - name: root_module_folder_relative_path
+    default: '.'
+
+steps:
+  - pwsh: |
+      $module = "${{ parameters.root_module_folder_relative_path }}"
+      New-Item -ItemType Directory -Path "$(Build.ArtifactStagingDirectory)" -Force | Out-Null
+
+      terraform -chdir="$module" show -no-color tfplan |
+        Set-Content -LiteralPath $env:PLAN_TEXT_PATH -Encoding utf8
+      if ($LASTEXITCODE -ne 0) { throw "terraform show failed rendering the text plan." }
+
+      terraform -chdir="$module" show -json tfplan |
+        Set-Content -LiteralPath $env:PLAN_JSON_PATH -Encoding utf8
+      if ($LASTEXITCODE -ne 0) { throw "terraform show -json failed." }
+    displayName: Render the plan
+    env:
+      PLAN_TEXT_PATH: $(Build.ArtifactStagingDirectory)/plan.txt
+      PLAN_JSON_PATH: $(Agent.TempDirectory)/plan.json
+
+  - pwsh: |
+      # >>> PLAN SUMMARY RENDERER BEGIN
+      # Inputs, all from the environment so this block runs unchanged outside a pipeline:
+      #   PLAN_JSON_PATH      terraform show -json output (read here, never published)
+      #   PLAN_TEXT_PATH      terraform show -no-color output (redacted, published)
+      #   PLAN_SUMMARY_PATH   markdown written by this block
+      #   PLAN_LABEL          heading, e.g. "CD - apply to Azure"
+      #   PLAN_ARTIFACT_NAME  artifact holding the full plan, named in the truncation note
+      # Optional, for the deep links. All four must be present or the footer is omitted,
+      # which is what happens when this block is run outside a pipeline:
+      #   PLAN_COLLECTION_URI  System.TeamFoundationCollectionUri
+      #   PLAN_PROJECT         System.TeamProject
+      #   PLAN_BUILD_ID        Build.BuildId
+      #   PLAN_JOB_ID          System.JobId - the timeline record this summary belongs to
+      #   PLAN_TASK_ID         the plan task's timeline record, set by terraform-plan.yaml.
+      #                        Without it the log link lands on the job rather than the step.
+      $ErrorActionPreference = "Stop"
+
+      $maxRows = 60
+      $maxPlanLines = 800
+
+      function Format-Cell([string] $Text) { return $Text.Replace("|", "\|") }
+
+      $plan = Get-Content -LiteralPath $env:PLAN_JSON_PATH -Raw | ConvertFrom-Json
+      $rawChanges = @()
+      if ($plan.PSObject.Properties.Name -contains "resource_changes") {
+        $rawChanges = @($plan.resource_changes)
+      }
+
+      # Data source reads are not changes to Azure, and no-op entries are every unchanged
+      # resource in the state - both would drown the table they are meant to clarify.
+      $changes = @(foreach ($item in $rawChanges) {
+        $actions = @($item.change.actions)
+        if ($actions -contains "no-op" -or $actions -contains "read") { continue }
+
+        $verb =
+          if ($actions -contains "delete" -and $actions -contains "create") { "replace" }
+          elseif ($actions -contains "delete") { "destroy" }
+          elseif ($actions -contains "create") { "add" }
+          else { "change" }
+
+        $reason = ""
+        if ($item.PSObject.Properties.Name -contains "action_reason") { $reason = [string]$item.action_reason }
+
+        [pscustomobject]@{
+          verb    = $verb
+          address = [string]$item.address
+          type    = [string]$item.type
+          reason  = $reason
+        }
+      })
+
+      $counts = [ordered]@{ add = 0; change = 0; replace = 0; destroy = 0 }
+      foreach ($change in $changes) { $counts[$change.verb]++ }
+
+      # Root outputs. terraform plan -detailed-exitcode reports a plan that changes only outputs
+      # as "changes present", so the CD apply stage runs and asks for approval; the summary has to
+      # say why. Names and actions only - a value can be sensitive.
+      $outputChanges = @()
+      if ($plan.PSObject.Properties.Name -contains "output_changes" -and $null -ne $plan.output_changes) {
+        $outputChanges = @(foreach ($property in $plan.output_changes.PSObject.Properties) {
+          $actions = @($property.Value.actions)
+          if ($actions.Count -eq 0 -or $actions -contains "no-op") { continue }
+          $verb =
+            if ($actions -contains "delete" -and $actions -contains "create") { "change" }
+            elseif ($actions -contains "delete") { "remove" }
+            elseif ($actions -contains "create") { "add" }
+            else { "change" }
+          [pscustomobject]@{ verb = $verb; name = [string]$property.Name }
+        })
+      }
+
+      # Objects Terraform found changed in Azure since the state was written - typically by
+      # someone in the portal or another pipeline. Information, not a planned action.
+      $drift = @()
+      if ($plan.PSObject.Properties.Name -contains "resource_drift" -and $null -ne $plan.resource_drift) {
+        $drift = @(foreach ($item in @($plan.resource_drift)) {
+          [pscustomobject]@{ address = [string]$item.address; type = [string]$item.type }
+        })
+      }
+
+      $icons = @{ add = "+"; change = "~"; replace = "+/-"; destroy = "-" }
+      $lines = [System.Collections.Generic.List[string]]::new()
+      $lines.Add("## Terraform plan - $($env:PLAN_LABEL)")
+      $lines.Add("")
+
+      if ($changes.Count -eq 0 -and $outputChanges.Count -eq 0) {
+        $lines.Add("**No changes.** Infrastructure matches the configuration.")
+        $lines.Add("")
+      }
+      elseif ($changes.Count -eq 0) {
+        $noun = if ($outputChanges.Count -eq 1) { "output changes" } else { "outputs change" }
+        $lines.Add("**No changes to Azure resources.** $($outputChanges.Count) $noun - applying writes the new values to the Terraform state only.")
+        $lines.Add("")
+      }
+      else {
+        $lines.Add("**" + (($counts.Keys | ForEach-Object { "$($counts[$_]) to $_" }) -join " | ") + "**")
+        $lines.Add("")
+
+        # Replacements and destroys lead, because they are the only entries where reading
+        # the rest of the table too late is expensive.
+        $destructive = @($changes | Where-Object { $_.verb -eq "replace" -or $_.verb -eq "destroy" })
+        if ($destructive.Count -gt 0) {
+          $lines.Add("### Destructive actions - read these first")
+          $lines.Add("")
+          $lines.Add("| Action | Address | Reason |")
+          $lines.Add("| --- | --- | --- |")
+          foreach ($change in ($destructive | Sort-Object verb, address)) {
+            $reason = if ($change.reason) { "``$($change.reason)``" } else { "-" }
+            $lines.Add("| $($icons[$change.verb]) $($change.verb) | ``$(Format-Cell $change.address)`` | $reason |")
+          }
+          $lines.Add("")
+        }
+
+        $lines.Add("### All changes")
+        $lines.Add("")
+        $lines.Add("| Action | Type | Address |")
+        $lines.Add("| --- | --- | --- |")
+        $rank = @("destroy", "replace", "change", "add")
+        $ordered = @($changes | Sort-Object @{ Expression = { $rank.IndexOf($_.verb) } }, address)
+        foreach ($change in ($ordered | Select-Object -First $maxRows)) {
+          $lines.Add("| $($icons[$change.verb]) $($change.verb) | ``$(Format-Cell $change.type)`` | ``$(Format-Cell $change.address)`` |")
+        }
+        if ($ordered.Count -gt $maxRows) {
+          $lines.Add("")
+          $lines.Add("_$($ordered.Count - $maxRows) further changes are not listed here. The full plan is below and in artifact ``$($env:PLAN_ARTIFACT_NAME)``._")
+        }
+        $lines.Add("")
+      }
+
+      if ($outputChanges.Count -gt 0) {
+        $lines.Add("### Output changes")
+        $lines.Add("")
+        $lines.Add("| Action | Output |")
+        $lines.Add("| --- | --- |")
+        $outputIcons = @{ add = "+"; change = "~"; remove = "-" }
+        $sortedOutputs = @($outputChanges | Sort-Object name)
+        foreach ($output in ($sortedOutputs | Select-Object -First $maxRows)) {
+          $lines.Add("| $($outputIcons[$output.verb]) $($output.verb) | ``$(Format-Cell $output.name)`` |")
+        }
+        if ($sortedOutputs.Count -gt $maxRows) {
+          $lines.Add("")
+          $lines.Add("_$($sortedOutputs.Count - $maxRows) further outputs are not listed here._")
+        }
+        $lines.Add("")
+      }
+
+      if ($drift.Count -gt 0) {
+        $lines.Add("### Changed outside Terraform")
+        $lines.Add("")
+        $lines.Add("Terraform found these objects changed in Azure since this state was last written - for example in the portal or by another pipeline. This is information, not an action: the plan changes one only if it is also listed above.")
+        $lines.Add("")
+        $lines.Add("| Type | Address |")
+        $lines.Add("| --- | --- |")
+        $sortedDrift = @($drift | Sort-Object address)
+        foreach ($item in ($sortedDrift | Select-Object -First $maxRows)) {
+          $lines.Add("| ``$(Format-Cell $item.type)`` | ``$(Format-Cell $item.address)`` |")
+        }
+        if ($sortedDrift.Count -gt $maxRows) {
+          $lines.Add("")
+          $lines.Add("_$($sortedDrift.Count - $maxRows) further objects are not listed here._")
+        }
+        $lines.Add("")
+      }
+
+      # git history is only present where the job checked out with fetchDepth 0. Saying so
+      # is the point - a silently missing section reads as "nothing changed". A missing
+      # HEAD^ is an expected outcome here, not an error, so it must not fail the step:
+      # pwsh 7.4 turns a non-zero native exit code into a terminating error by default.
+      $lines.Add("### Files in this change")
+      $lines.Add("")
+      $commit = ""
+      $diff = @()
+      $gitOk = $true
+      try {
+        $commit = & git log -1 --pretty=format:'%h  %an  %s' 2>$null
+        if ($LASTEXITCODE -ne 0) { $gitOk = $false }
+        $diff = @(& git diff --name-status HEAD^ HEAD 2>$null)
+        if ($LASTEXITCODE -ne 0) { $gitOk = $false }
+      }
+      catch { $gitOk = $false }
+      if (-not $gitOk -or $diff.Count -eq 0) {
+        $lines.Add("_Not available: this job has no commit history. Set ``fetchDepth: 0`` on the checkout to enable this section._")
+      }
+      else {
+        $lines.Add("``$commit``")
+        $lines.Add("")
+        $lines.Add("| Status | File |")
+        $lines.Add("| --- | --- |")
+        foreach ($entry in $diff) {
+          $parts = $entry -split "`t", 2
+          if ($parts.Count -eq 2) { $lines.Add("| $($parts[0]) | ``$(Format-Cell $parts[1])`` |") }
+        }
+      }
+      $lines.Add("")
+
+      $planText = @(Get-Content -LiteralPath $env:PLAN_TEXT_PATH)
+      $shown = $planText
+      $truncated = $false
+      if ($planText.Count -gt $maxPlanLines) {
+        $shown = @($planText | Select-Object -First $maxPlanLines)
+        $truncated = $true
+      }
+      $lines.Add("<details>")
+      $lines.Add("<summary>Full plan, sensitive values redacted - $($planText.Count) lines</summary>")
+      $lines.Add("")
+      $lines.Add('```')
+      foreach ($line in $shown) { $lines.Add($line) }
+      if ($truncated) {
+        $lines.Add("")
+        $lines.Add("... truncated at $maxPlanLines of $($planText.Count) lines. The whole plan is in artifact '$($env:PLAN_ARTIFACT_NAME)'.")
+      }
+      $lines.Add('```')
+      $lines.Add("")
+      $lines.Add("</details>")
+
+      # The summary is deliberately short, so it has to say where the rest lives. Built from
+      # parts rather than a pre-joined string so the project name is encoded, and skipped
+      # entirely when any part is missing - a half-formed link is worse than none.
+      # An unset pipeline variable arrives as the literal "$(name)", which is not a value.
+      function Test-Supplied([string] $Value) {
+        return -not ([string]::IsNullOrWhiteSpace($Value) -or $Value.Contains('$('))
+      }
+      $linkParts = @($env:PLAN_COLLECTION_URI, $env:PLAN_PROJECT, $env:PLAN_BUILD_ID, $env:PLAN_JOB_ID)
+      if (-not ($linkParts | Where-Object { -not (Test-Supplied $_) })) {
+        $base = "$($env:PLAN_COLLECTION_URI.TrimEnd('/'))/$([uri]::EscapeDataString($env:PLAN_PROJECT))/_build/results?buildId=$($env:PLAN_BUILD_ID)"
+        $logUrl = "$base&view=logs&j=$($env:PLAN_JOB_ID)"
+        # j alone opens the job with no step selected. t selects the plan step itself.
+        if (Test-Supplied $env:PLAN_TASK_ID) { $logUrl += "&t=$($env:PLAN_TASK_ID)" }
+        $lines.Add("")
+        $lines.Add("[Open the full log]($logUrl) | [Download the plan]($base&view=artifacts&type=publishedArtifacts)")
+      }
+
+      Set-Content -LiteralPath $env:PLAN_SUMMARY_PATH -Value $lines -Encoding utf8
+      Write-Host "Wrote $($lines.Count) markdown lines describing $($changes.Count) change(s), $($outputChanges.Count) output change(s), $($drift.Count) object(s) changed outside Terraform."
+      # <<< PLAN SUMMARY RENDERER END
+
+      Remove-Item -LiteralPath $env:PLAN_JSON_PATH -Force -ErrorAction SilentlyContinue
+      Write-Host "##vso[task.uploadsummary]$($env:PLAN_SUMMARY_PATH)"
+    displayName: Attach the plan to the run summary
+    env:
+      PLAN_TEXT_PATH: $(Build.ArtifactStagingDirectory)/plan.txt
+      PLAN_JSON_PATH: $(Agent.TempDirectory)/plan.json
+      # The Extensions tab is built into Azure DevOps and cannot be renamed. It labels each
+      # attachment with the FILE NAME, so the file name is the heading the reviewer reads.
+      PLAN_SUMMARY_PATH: $(Build.ArtifactStagingDirectory)/Terraform Plan.md
+      PLAN_LABEL: ${{ parameters.stage_label }}
+      PLAN_ARTIFACT_NAME: ${{ parameters.artifact_name }}
+      PLAN_COLLECTION_URI: $(System.TeamFoundationCollectionUri)
+      PLAN_PROJECT: $(System.TeamProject)
+      PLAN_BUILD_ID: $(Build.BuildId)
+      PLAN_JOB_ID: $(System.JobId)
+      PLAN_TASK_ID: $(planTaskId)
+
+  - task: PublishPipelineArtifact@1
+    displayName: Publish the redacted plan
+    inputs:
+      targetPath: '$(Build.ArtifactStagingDirectory)/plan.txt'
+      artifact: '${{ parameters.artifact_name }}'
+      publishLocation: 'pipeline'

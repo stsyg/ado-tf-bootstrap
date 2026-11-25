@@ -1,0 +1,204 @@
+---
+# Plans with the stage's service connection and records whether the plan has changes.
+#   -detailed-exitcode  0 = no changes, 1 = error, 2 = changes. Captured into the planHasChanges
+#                       output variable so the CD apply stage is skipped when the plan is empty.
+#   -lock-timeout       a plan that meets a state lock waits for it instead of failing at once - when the
+#                       plan identity may write the state (state_lock: true). Otherwise the plan runs
+#                       with -lock=false: it only reads the state, so it needs no lock and none can
+#                       be left behind.
+#   state lock check    (state_lock: true) before the plan: a lock a cancelled or lost run left behind
+#                       is released, and nothing is ever released while another run of this
+#                       repository is in progress.
+parameters:
+  - name: terraform_action
+    default: 'apply'
+  - name: serviceConnection
+  - name: root_module_folder_relative_path
+    default: '.'
+  - name: state_lock_timeout
+    default: '30m'
+  # false: plan runs with -lock=false (the plan identity only reads the state) and the lock check
+  # below is skipped. true: plan takes the lock like an apply does.
+  - name: state_lock
+    type: boolean
+    default: false
+
+steps:
+  # A separate step on purpose: it is the only one that sees the job's Azure DevOps token,
+  # and terraform plan runs repository code - in CI, a pull request's.
+  - task: AzureCLI@2
+    name: tflock
+    displayName: Check the state lock
+    condition: eq('${{ parameters.state_lock }}', 'true')
+    inputs:
+      azureSubscription: ${{ parameters.serviceConnection }}
+      scriptType: pscore
+      scriptLocation: inlineScript
+      addSpnToEnvironment: true
+      inlineScript: |
+        az account show 2>$null | ConvertFrom-Json | Set-Variable account
+        $env:ARM_TENANT_ID = $account.tenantId
+        $env:ARM_SUBSCRIPTION_ID = $account.id
+        $env:ARM_OIDC_TOKEN = $env:idToken
+        $env:ARM_USE_OIDC = "true"
+        $env:ARM_CLIENT_ID = $account.user.name
+        $env:ARM_USE_AZUREAD = "true"
+        $PSNativeCommandUseErrorActionPreference = $false
+
+        # >>> STATE LOCK DECISION BEGIN
+        # What to do about a lease on the state blob. Pure: inputs in, decision out, no I/O.
+        #   LeaseState       'leased' when the state blob holds a lease
+        #   LockInfo         Terraform's lock record (blob metadata terraformlockid), or $null
+        #   OtherRunsActive  $true / $false, or $null when it could not be read
+        #   ReleaseId        STATE_LOCK_RELEASE_ID from the variable group, '' when unset
+        function Get-StateLockDecision {
+          param([string] $LeaseState, $LockInfo, $OtherRunsActive, [string] $ReleaseId)
+          function New-Decision([string] $Action, [string] $Reason) { [pscustomobject]@{ action = $Action; reason = $Reason } }
+          if ($LeaseState -ne 'leased') { return New-Decision 'proceed' 'The state is not locked.' }
+          if ($null -eq $OtherRunsActive) {
+            return New-Decision 'wait' 'The state is locked and it could not be read whether another run of this repository is in progress, so the plan waits for the lock.'
+          }
+          if ($OtherRunsActive) {
+            return New-Decision 'wait' 'The state is locked by another run of this repository that is still in progress; the plan waits for it.'
+          }
+          $id = if ($LockInfo -and $LockInfo.PSObject.Properties.Name -contains 'ID') { [string]$LockInfo.ID } else { '' }
+          $operation = if ($LockInfo -and $LockInfo.PSObject.Properties.Name -contains 'Operation') { [string]$LockInfo.Operation } else { '' }
+          if ($ReleaseId) {
+            if ($id -and $ReleaseId -ceq $id) { return New-Decision 'unlock' "STATE_LOCK_RELEASE_ID authorises releasing lock $id." }
+            if (-not $id -and $ReleaseId -ceq 'break-lease') { return New-Decision 'break-lease' 'STATE_LOCK_RELEASE_ID authorises breaking a lease that carries no Terraform lock record.' }
+            return New-Decision 'stop' "STATE_LOCK_RELEASE_ID is set but does not match this lock ('$(if ($id) { $id } else { 'no lock record: use break-lease' })'). Nothing was released."
+          }
+          if ($id -and $operation -ceq 'OperationTypePlan') {
+            return New-Decision 'unlock' "No run of this repository is in progress, so plan lock $id was left by a run that was cancelled or lost its agent. A plan writes no state, so releasing it is safe."
+          }
+          if (-not $id) {
+            return New-Decision 'stop' 'The state blob is leased but carries no Terraform lock record. Nothing was released.'
+          }
+          return New-Decision 'stop' "No run of this repository is in progress, but lock $id was taken by $(if ($operation) { $operation } else { 'an unknown operation' }). An interrupted apply may have left the state incomplete, so it is not released automatically."
+        }
+        # <<< STATE LOCK DECISION END
+
+        $module = "${{ parameters.root_module_folder_relative_path }}"
+        $backendPath = Join-Path $module '.terraform/terraform.tfstate'
+        if (-not (Test-Path -LiteralPath $backendPath)) { Write-Host "No initialised backend at $backendPath - nothing to check."; exit 0 }
+        $backend = (Get-Content -LiteralPath $backendPath -Raw | ConvertFrom-Json).backend
+        if ($backend.type -ne 'azurerm') { Write-Host "Backend '$($backend.type)' - nothing to check."; exit 0 }
+        $config = $backend.config
+
+        $blobJson = az storage blob show --auth-mode login --account-name $config.storage_account_name --container-name $config.container_name --name $config.key --only-show-errors -o json 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $blobJson) { Write-Host "The state blob $($config.container_name)/$($config.key) could not be read (a first run has none) - nothing to check."; exit 0 }
+        $blob = ($blobJson -join "`n") | ConvertFrom-Json
+        $leaseState = [string]$blob.properties.lease.state
+
+        $lockInfo = $null
+        $recorded = $null
+        if ($blob.metadata -and $blob.metadata.PSObject.Properties.Name -contains 'terraformlockid') { $recorded = [string]$blob.metadata.terraformlockid }
+        if ($recorded) {
+          try { $lockInfo = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($recorded)) | ConvertFrom-Json } catch { $lockInfo = $null }
+        }
+
+        $otherRunsActive = $false
+        if ($leaseState -eq 'leased') {
+          try {
+            $uri = "$($env:SYSTEM_COLLECTIONURI)$([uri]::EscapeDataString($env:SYSTEM_TEAMPROJECT))/_apis/build/builds?repositoryId=$($env:BUILD_REPOSITORY_ID)&repositoryType=TfsGit&statusFilter=inProgress&api-version=7.1"
+            $runs = @((Invoke-RestMethod -Headers @{ Authorization = "Bearer $($env:SYSTEM_ACCESSTOKEN)" } -Uri $uri).value)
+            $otherRunsActive = @($runs | Where-Object { [string]$_.id -ne [string]$env:BUILD_BUILDID }).Count -gt 0
+          }
+          catch { $otherRunsActive = $null }
+        }
+        Remove-Item env:SYSTEM_ACCESSTOKEN -ErrorAction SilentlyContinue
+
+        $releaseId = [string]$env:STATE_LOCK_RELEASE_ID
+        if ($releaseId.Contains('$(')) { $releaseId = '' }
+        $decision = Get-StateLockDecision -LeaseState $leaseState -LockInfo $lockInfo -OtherRunsActive $otherRunsActive -ReleaseId $releaseId.Trim()
+
+        if ($leaseState -eq 'leased') {
+          Write-Host "State $($config.container_name)/$($config.key) is locked."
+          if ($lockInfo) { Write-Host "  Lock ID: $($lockInfo.ID)`n  Operation: $($lockInfo.Operation)`n  Who: $($lockInfo.Who)`n  Created: $($lockInfo.Created)" }
+        }
+        Write-Host $decision.reason
+
+        switch ($decision.action) {
+          'unlock' {
+            & terraform "-chdir=$module" force-unlock -force $lockInfo.ID
+            if ($LASTEXITCODE -eq 0) { Write-Host "##vso[task.logissue type=warning]Released state lock $($lockInfo.ID) ($($lockInfo.Operation), $($lockInfo.Who), $($lockInfo.Created)). $($decision.reason)" }
+            else { Write-Host "##vso[task.logissue type=warning]Could not release state lock $($lockInfo.ID); the plan waits for it." }
+          }
+          'break-lease' {
+            az storage blob lease break --auth-mode login --account-name $config.storage_account_name --container-name $config.container_name --blob-name $config.key --lease-break-period 0 --only-show-errors -o none
+            if ($LASTEXITCODE -eq 0) { Write-Host "##vso[task.logissue type=warning]Broke the lease on $($config.container_name)/$($config.key). $($decision.reason)" }
+            else { Write-Host "##vso[task.logissue type=warning]Could not break the lease on $($config.container_name)/$($config.key); the plan waits for it." }
+          }
+          'stop' {
+            Write-Host "##vso[task.logissue type=error]$($decision.reason) To release it after checking the last run's log: add variable STATE_LOCK_RELEASE_ID = $(if ($lockInfo) { $lockInfo.ID } else { 'break-lease' }) to this repository's variable group, run the pipeline again, then delete the variable. See 'State lock' in the templates repository's README."
+            exit 1
+          }
+        }
+        exit 0
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      STATE_LOCK_RELEASE_ID: $(STATE_LOCK_RELEASE_ID)
+
+  - task: AzureCLI@2
+    name: tfplan
+    displayName: Terraform Plan for ${{ coalesce(parameters.terraform_action, 'Apply') }}
+    inputs:
+      azureSubscription: ${{ parameters.serviceConnection }}
+      scriptType: pscore
+      scriptLocation: inlineScript
+      addSpnToEnvironment: true
+      inlineScript: |
+        # Get settings from service connection
+        az account show 2>$null | ConvertFrom-Json | Set-Variable account
+        $clientId = $account.user.name
+        $oidcToken = $env:idToken # requires addSpnToEnvironment: true
+
+        $env:ARM_TENANT_ID = $account.tenantId
+        $env:ARM_SUBSCRIPTION_ID = $account.id
+        $env:ARM_OIDC_TOKEN = $oidcToken
+        $env:ARM_USE_OIDC = "true"
+        $env:ARM_CLIENT_ID = $clientId
+        $env:ARM_USE_AZUREAD = "true"
+
+        # Run Terraform Plan
+        $command = "terraform"
+        $arguments = @()
+        $arguments += "-chdir=${{ parameters.root_module_folder_relative_path }}"
+        $arguments += "plan"
+        $arguments += "-out=tfplan"
+        $arguments += "-input=false"
+        $arguments += "-detailed-exitcode"
+        if ($env:PLAN_TAKES_STATE_LOCK -eq 'true') { $arguments += "-lock-timeout=${{ parameters.state_lock_timeout }}" }
+        else { $arguments += "-lock=false" }
+
+        if ($env:TERRAFORM_ACTION -eq 'destroy') {
+          $arguments += "-destroy"
+        }
+
+        Write-Host "Running: $command $arguments"
+        & $command $arguments
+        $planExitCode = $LASTEXITCODE
+
+        # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes present. AzureCLI@2
+        # fails the step on any non-zero exit, so 2 has to be swallowed here or a plan that
+        # found work would look like a broken pipeline.
+        # Any other code (137 = killed, as on a cancelled run) means there is no usable plan.
+        if ($planExitCode -notin 0, 2) {
+          Write-Host "##vso[task.logissue type=error]terraform plan failed with exit code $planExitCode."
+          exit 1
+        }
+
+        # Anything that is not a clean "no changes" is treated as changes present, so a
+        # future exit code we do not recognise can never silently skip the apply stage.
+        $hasChanges = ($planExitCode -ne 0).ToString().ToLowerInvariant()
+        Write-Host "Plan exit code $planExitCode - changes present: $hasChanges"
+        Write-Host "##vso[task.setvariable variable=planHasChanges;isOutput=true]$hasChanges"
+
+        # This task's own timeline record, so the summary can link straight at the plan
+        # output rather than at the job that contains it.
+        Write-Host "##vso[task.setvariable variable=planTaskId]$($env:SYSTEM_TASKINSTANCEID)"
+        exit 0
+
+    env:
+      TERRAFORM_ACTION: ${{ coalesce(parameters.terraform_action, 'apply') }}
+      PLAN_TAKES_STATE_LOCK: ${{ lower(parameters.state_lock) }}

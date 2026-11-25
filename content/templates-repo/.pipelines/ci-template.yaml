@@ -1,0 +1,135 @@
+---
+# Continuous integration for a Terraform repository: validates the code, then plans it against the
+# real state with the read-only plan identity and shows the plan in the run's summary.
+#
+# A pipeline in the main repository extends this template (see its .pipelines/ci.yaml). The
+# service connections are protected by a "required template" check naming this file, so a pipeline
+# that does not extend it cannot sign in to Azure.
+parameters:
+  - name: root_module_folder_relative_path
+    default: '.'
+  - name: terraform_cli_version
+    default: 'latest'
+  # The names the bootstrap created. No defaults on purpose: a missing name fails the run at once.
+  - name: variable_group_name
+    type: string
+  - name: plan_environment_name
+    type: string
+  - name: plan_service_connection_name
+    type: string
+  # Empty runs on a Microsoft-hosted agent (ubuntu-latest); a name runs on that self-hosted pool.
+  - name: agent_pool_name
+    default: ''
+  - name: state_file_name
+    default: 'terraform.tfstate'
+  # How long plan waits for a state lock another run holds before failing (Terraform -lock-timeout).
+  - name: state_lock_timeout
+    default: '30m'
+  # false: plan runs with -lock=false, for a plan identity that can only read the state (the
+  # bootstrap's default). true: plan takes the state lock and the stale-lock check runs first.
+  - name: plan_takes_state_lock
+    type: boolean
+    default: false
+  # Checkov on the repository's Terraform through the Microsoft Security DevOps extension, which must
+  # be installed in the organization. Warn only: a finding never fails the run. Off by default.
+  - name: security_scan
+    type: boolean
+    default: false
+
+stages:
+  - stage: validate
+    displayName: Validation Terraform
+    variables:
+      - group: ${{ parameters.variable_group_name }}
+    jobs:
+      - job: validate
+        displayName: Validate Terraform
+        pool:
+          ${{ if ne(parameters.agent_pool_name, '') }}:
+            name: ${{ parameters.agent_pool_name }}
+          ${{ else }}:
+            vmImage: ubuntu-latest
+        steps:
+          # First, so it runs even when the format check fails. Only this repository's source is
+          # scanned, never a plan. Results go to artifact CodeAnalysisLogs, the name Defender for
+          # Cloud collects.
+          - ${{ if eq(parameters.security_scan, true) }}:
+              - task: MicrosoftSecurityDevOps@1
+                displayName: Scan the Terraform for security findings (warn only)
+                continueOnError: true
+                env:
+                  LOG_LEVEL: ERROR
+                inputs:
+                  categories: 'IaC'
+                  tools: 'checkov'
+                  break: false
+                  publish: true
+                  artifactName: 'CodeAnalysisLogs'
+          - template: helpers/terraform-installer.yaml
+            parameters:
+              terraformVersion: ${{ parameters.terraform_cli_version }}
+          - pwsh: |
+              terraform `
+              -chdir="${{ parameters.root_module_folder_relative_path }}" `
+              fmt `
+              -check `
+              -recursive
+            displayName: Terraform Format Check
+          - pwsh: |
+              terraform `
+              -chdir="${{ parameters.root_module_folder_relative_path }}" `
+              init `
+              -backend=false
+            displayName: Terraform Init
+          - pwsh: |
+              terraform `
+              -chdir="${{ parameters.root_module_folder_relative_path }}" `
+              validate
+            displayName: Terraform Validate
+      - deployment: plan
+        dependsOn: validate
+        displayName: Validate Terraform Plan
+        pool:
+          ${{ if ne(parameters.agent_pool_name, '') }}:
+            name: ${{ parameters.agent_pool_name }}
+          ${{ else }}:
+            vmImage: ubuntu-latest
+        environment: ${{ parameters.plan_environment_name }}
+        timeoutInMinutes: 0
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  displayName: Checkout Terraform Module
+                  # HEAD^ does not exist under the default shallow clone, and the summary
+                  # needs it to list the files this pull request changes.
+                  fetchDepth: 0
+                - template: helpers/terraform-installer.yaml
+                  parameters:
+                    terraformVersion: ${{ parameters.terraform_cli_version }}
+                - template: helpers/terraform-init.yaml
+                  parameters:
+                    serviceConnection: ${{ parameters.plan_service_connection_name }}
+                    backendAzureResourceGroupName: $(BACKEND_AZURE_RESOURCE_GROUP_NAME)
+                    backendAzureStorageAccountName: $(BACKEND_AZURE_STORAGE_ACCOUNT_NAME)
+                    backendAzureStorageAccountContainerName: $(BACKEND_AZURE_STORAGE_ACCOUNT_CONTAINER_NAME)
+                    backendAzureStorageAccountContainerKeyName: ${{ parameters.state_file_name }}
+                    root_module_folder_relative_path: ${{ parameters.root_module_folder_relative_path }}
+                - template: helpers/terraform-plan.yaml
+                  parameters:
+                    serviceConnection: ${{ parameters.plan_service_connection_name }}
+                    root_module_folder_relative_path: ${{ parameters.root_module_folder_relative_path }}
+                    state_lock_timeout: ${{ parameters.state_lock_timeout }}
+                    state_lock: ${{ parameters.plan_takes_state_lock }}
+                - template: helpers/terraform-plan-summary.yaml
+                  parameters:
+                    # The run's reason names the plan: a scheduled run is not a pull request.
+                    ${{ if eq(variables['Build.Reason'], 'Schedule') }}:
+                      stage_label: 'CI - scheduled run'
+                    ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
+                      stage_label: 'CI - pull request'
+                    ${{ if and(ne(variables['Build.Reason'], 'Schedule'), ne(variables['Build.Reason'], 'PullRequest')) }}:
+                      stage_label: "CI - ${{ variables['Build.SourceBranchName'] }}"
+                    artifact_name: 'plan-ci'
+                    root_module_folder_relative_path: ${{ parameters.root_module_folder_relative_path }}

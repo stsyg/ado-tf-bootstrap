@@ -1,0 +1,31 @@
+---
+# 01 ${pipeline_display_name} Continuous Integration
+# Runs on every pull request into main (the branch policy queues it) and on demand. All the steps
+# are in the templates repository; this file only names what the bootstrap created.
+trigger:
+  - none
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: '${project_reference}/${templates_repository}'
+
+parameters:
+  - name: terraform_cli_version
+    displayName: Terraform CLI Version
+    type: string
+    default: '${terraform_cli_version}'
+
+lockBehavior: sequential
+
+extends:
+  template: .pipelines/ci-template.yaml@templates
+  parameters:
+    root_module_folder_relative_path: .
+    terraform_cli_version: $${{ coalesce(parameters.terraform_cli_version, 'latest') }}
+    variable_group_name: '${variable_group_name}'
+    plan_environment_name: '${plan_environment}'
+    plan_service_connection_name: '${plan_connection}'
+    agent_pool_name: '${agent_pool_name}'
+    plan_takes_state_lock: ${plan_state_lock}

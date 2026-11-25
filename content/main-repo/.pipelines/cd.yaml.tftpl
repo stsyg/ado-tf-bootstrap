@@ -1,0 +1,43 @@
+---
+# 02 ${pipeline_display_name} Continuous Delivery
+# Runs when a change merges into main, and on demand. It plans; if the plan has changes it waits
+# for the approvers, then applies that plan. All the steps are in the templates repository.
+trigger:
+  branches:
+    include:
+      - main
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: '${project_reference}/${templates_repository}'
+
+parameters:
+  - name: terraform_action
+    displayName: Terraform Action to perform
+    type: string
+    default: 'apply'
+    values:
+      - 'apply'
+      - 'destroy'
+  - name: terraform_cli_version
+    displayName: Terraform CLI Version
+    type: string
+    default: '${terraform_cli_version}'
+
+lockBehavior: sequential
+
+extends:
+  template: .pipelines/cd-template.yaml@templates
+  parameters:
+    terraform_action: $${{ parameters.terraform_action }}
+    root_module_folder_relative_path: .
+    terraform_cli_version: $${{ coalesce(parameters.terraform_cli_version, 'latest') }}
+    variable_group_name: '${variable_group_name}'
+    plan_environment_name: '${plan_environment}'
+    apply_environment_name: '${apply_environment}'
+    plan_service_connection_name: '${plan_connection}'
+    apply_service_connection_name: '${apply_connection}'
+    agent_pool_name: '${agent_pool_name}'
+    plan_takes_state_lock: ${plan_state_lock}

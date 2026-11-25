@@ -1,0 +1,59 @@
+---
+# Applies the plan file the plan stage saved, signed in as the apply service connection. The
+# apply stage runs only after the approval check on that connection.
+parameters:
+  - name: terraform_action
+    default: 'apply'
+  - name: serviceConnection
+  - name: root_module_folder_relative_path
+    default: '.'
+  - name: state_lock_timeout
+    default: '30m'
+
+steps:
+  - task: AzureCLI@2
+    displayName: Terraform Apply for ${{ coalesce(parameters.terraform_action, 'Apply') }}
+    inputs:
+      azureSubscription: ${{ parameters.serviceConnection }}
+      scriptType: pscore
+      scriptLocation: inlineScript
+      addSpnToEnvironment: true
+      inlineScript: |
+        # Get settings from service connection
+        az account show 2>$null | ConvertFrom-Json | Set-Variable account
+        $clientId = $account.user.name
+        $oidcToken = $env:idToken # requires addSpnToEnvironment: true
+
+        $env:ARM_TENANT_ID = $account.tenantId
+        $env:ARM_SUBSCRIPTION_ID = $account.id
+        $env:ARM_USE_OIDC = "true"
+        $env:ARM_CLIENT_ID = $clientId
+        $env:ARM_USE_AZUREAD = "true"
+
+        # The ID token of a federated sign-in lives about five minutes, and an apply can outlast the
+        # access token it was exchanged for. With the service connection's ID the azurerm and azapi
+        # providers (and the backend) ask Azure DevOps for a new ID token when they need one. This is
+        # the one step that gets the job token, and it runs code that was merged to main and approved.
+        # An agent that does not offer the connection ID falls back to the single token.
+        if ($env:AZURESUBSCRIPTION_SERVICE_CONNECTION_ID -and $env:ARM_OIDC_REQUEST_TOKEN) {
+          $env:ARM_OIDC_AZURE_SERVICE_CONNECTION_ID = $env:AZURESUBSCRIPTION_SERVICE_CONNECTION_ID
+          Write-Host "ID token refresh is on for this apply."
+        }
+        else {
+          $env:ARM_OIDC_TOKEN = $oidcToken
+          Write-Host "ID token refresh is not available on this agent: the apply uses the single ID token."
+        }
+
+        # Run Terraform Apply. -lock-timeout makes an apply that meets a state lock held by another
+        # run wait for it instead of failing at once.
+        $command = "terraform"
+        $arguments = @()
+        $arguments += "-chdir=${{ parameters.root_module_folder_relative_path }}"
+        $arguments += "apply"
+        $arguments += "-auto-approve"
+        $arguments += "-lock-timeout=${{ parameters.state_lock_timeout }}"
+        $arguments += "tfplan"
+        Write-Host "Running: $command $arguments"
+        & $command $arguments
+    env:
+      ARM_OIDC_REQUEST_TOKEN: $(System.AccessToken)

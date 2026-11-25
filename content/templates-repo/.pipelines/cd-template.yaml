@@ -1,0 +1,159 @@
+---
+# Continuous delivery for a Terraform repository: plans main with the read-only plan identity, shows
+# the plan in the run's summary, and - only when the plan has changes, and after the approval check on
+# the apply service connection - applies exactly that plan with the apply identity.
+#
+# A pipeline in the main repository extends this template (see its .pipelines/cd.yaml). The service
+# connections are protected by a "required template" check naming this file.
+parameters:
+  - name: terraform_action
+    default: 'apply'
+  - name: root_module_folder_relative_path
+    default: '.'
+  - name: terraform_cli_version
+    default: 'latest'
+  # The names the bootstrap created. No defaults on purpose: a missing name fails the run at once.
+  - name: variable_group_name
+    type: string
+  - name: plan_environment_name
+    type: string
+  - name: apply_environment_name
+    type: string
+  - name: plan_service_connection_name
+    type: string
+  - name: apply_service_connection_name
+    type: string
+  # Empty runs on a Microsoft-hosted agent (ubuntu-latest); a name runs on that self-hosted pool.
+  - name: agent_pool_name
+    default: ''
+  - name: state_file_name
+    default: 'terraform.tfstate'
+  # How long plan and apply wait for a state lock another run holds before failing (Terraform -lock-timeout).
+  - name: state_lock_timeout
+    default: '30m'
+  # false: plan runs with -lock=false, for a plan identity that can only read the state (the
+  # bootstrap's default); apply always locks. true: plan takes the state lock and the stale-lock
+  # check runs first.
+  - name: plan_takes_state_lock
+    type: boolean
+    default: false
+
+stages:
+  - stage: plan
+    displayName: Plan
+    variables:
+      - group: ${{ parameters.variable_group_name }}
+    jobs:
+      - deployment: plan
+        displayName: Plan with Terraform
+        pool:
+          ${{ if ne(parameters.agent_pool_name, '') }}:
+            name: ${{ parameters.agent_pool_name }}
+          ${{ else }}:
+            vmImage: ubuntu-latest
+        environment: ${{ parameters.plan_environment_name }}
+        timeoutInMinutes: 0
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  displayName: Checkout Terraform Module
+                  # HEAD^ does not exist under the default shallow clone, and the summary
+                  # needs it to list the files this merge brought in.
+                  fetchDepth: 0
+                - template: helpers/terraform-installer.yaml
+                  parameters:
+                    terraformVersion: ${{ parameters.terraform_cli_version }}
+                - template: helpers/terraform-init.yaml
+                  parameters:
+                    serviceConnection: ${{ parameters.plan_service_connection_name }}
+                    backendAzureResourceGroupName: $(BACKEND_AZURE_RESOURCE_GROUP_NAME)
+                    backendAzureStorageAccountName: $(BACKEND_AZURE_STORAGE_ACCOUNT_NAME)
+                    backendAzureStorageAccountContainerName: $(BACKEND_AZURE_STORAGE_ACCOUNT_CONTAINER_NAME)
+                    backendAzureStorageAccountContainerKeyName: ${{ parameters.state_file_name }}
+                    root_module_folder_relative_path: ${{ parameters.root_module_folder_relative_path }}
+                - template: helpers/terraform-plan.yaml
+                  parameters:
+                    terraform_action: ${{ parameters.terraform_action }}
+                    serviceConnection: ${{ parameters.plan_service_connection_name }}
+                    root_module_folder_relative_path: ${{ parameters.root_module_folder_relative_path }}
+                    state_lock_timeout: ${{ parameters.state_lock_timeout }}
+                    state_lock: ${{ parameters.plan_takes_state_lock }}
+                # The apply stage downloads this: it applies the code that was planned, not whatever
+                # main holds by the time an approver clicks.
+                - task: CopyFiles@2
+                  displayName: Create Module Artifact
+                  inputs:
+                    SourceFolder: '$(Build.SourcesDirectory)'
+                    Contents: |
+                      **/*
+                      !.terraform/**/*
+                      !.git/**/*
+                      !.pipelines/**/*
+                      !**/.terraform/**/*
+                      !**/.git/**/*
+                      !**/.pipelines/**/*
+                    TargetFolder: '$(Build.ArtifactsStagingDirectory)'
+                    CleanTargetFolder: true
+                    OverWrite: true
+                - task: PublishPipelineArtifact@1
+                  displayName: Publish Module Artifact
+                  inputs:
+                    targetPath: '$(Build.ArtifactsStagingDirectory)'
+                    artifact: 'module'
+                    publishLocation: 'pipeline'
+                - template: helpers/terraform-plan-summary.yaml
+                  parameters:
+                    stage_label: 'CD - apply to Azure'
+                    artifact_name: 'plan-cd'
+                    root_module_folder_relative_path: ${{ parameters.root_module_folder_relative_path }}
+  - stage: apply
+    displayName: Apply
+    dependsOn: plan
+    # Skipped when the plan found nothing to do, so an approver is only ever asked to approve a run
+    # that will change something. Anything other than a clean "no changes" sets this to true, so an
+    # unrecognised plan outcome can never skip the apply.
+    condition: and(succeeded(), eq(dependencies.plan.outputs['plan.plan.tfplan.planHasChanges'], 'true'))
+    # A run waiting for the apply lock queues behind the one holding it; the default would cancel it.
+    lockBehavior: sequential
+    variables:
+      - group: ${{ parameters.variable_group_name }}
+    jobs:
+      - deployment: apply
+        displayName: Apply with Terraform
+        pool:
+          ${{ if ne(parameters.agent_pool_name, '') }}:
+            name: ${{ parameters.agent_pool_name }}
+          ${{ else }}:
+            vmImage: ubuntu-latest
+        environment: ${{ parameters.apply_environment_name }}
+        timeoutInMinutes: 0
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: none
+                - task: DownloadPipelineArtifact@2
+                  displayName: Download Module Artifact
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'module'
+                    targetPath: '$(Build.SourcesDirectory)'
+                - template: helpers/terraform-installer.yaml
+                  parameters:
+                    terraformVersion: ${{ parameters.terraform_cli_version }}
+                - template: helpers/terraform-init.yaml
+                  parameters:
+                    serviceConnection: ${{ parameters.apply_service_connection_name }}
+                    backendAzureResourceGroupName: $(BACKEND_AZURE_RESOURCE_GROUP_NAME)
+                    backendAzureStorageAccountName: $(BACKEND_AZURE_STORAGE_ACCOUNT_NAME)
+                    backendAzureStorageAccountContainerName: $(BACKEND_AZURE_STORAGE_ACCOUNT_CONTAINER_NAME)
+                    backendAzureStorageAccountContainerKeyName: ${{ parameters.state_file_name }}
+                    root_module_folder_relative_path: ${{ parameters.root_module_folder_relative_path }}
+                - template: helpers/terraform-apply.yaml
+                  parameters:
+                    terraform_action: ${{ parameters.terraform_action }}
+                    serviceConnection: ${{ parameters.apply_service_connection_name }}
+                    root_module_folder_relative_path: ${{ parameters.root_module_folder_relative_path }}
+                    state_lock_timeout: ${{ parameters.state_lock_timeout }}
