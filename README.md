@@ -21,7 +21,7 @@ and state next to it.
 **1. Clone the kit once** (anywhere; pull it again before each new project to get the latest):
 
 ```pwsh
-git clone <this repository's URL> C:\repo\project-bootstrap-kit
+git clone https://github.com/stsyg/ado-tf-bootstrap.git C:\repo\ado-tf-bootstrap
 ```
 
 **2. Copy it into the project's folder** - a `bootstrap\project-bootstrap` folder in the project's repository
@@ -29,7 +29,7 @@ git clone <this repository's URL> C:\repo\project-bootstrap-kit
 and any `output` and `.terraform` folders:
 
 ```pwsh
-robocopy C:\repo\project-bootstrap-kit C:\repo\<project>\bootstrap\project-bootstrap /E /XD .git output .terraform
+robocopy C:\repo\ado-tf-bootstrap C:\repo\<project>\bootstrap\project-bootstrap /E /XD .git output .terraform
 ```
 
 The kit's own `.gitignore` keeps `output\` (the answers, the variables, the bootstrap's state) and
