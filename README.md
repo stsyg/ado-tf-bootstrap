@@ -403,3 +403,12 @@ one is tagged itself; Azure DevOps objects have no tags. The same tags go into t
 | `content/main-repo/` | What the main repository starts with (`*.tftpl` are rendered with your answers). |
 | `content/templates-repo/` | The pipeline templates repository, committed as it is. |
 | `tests/` | The tests above and their mocks. |
+
+## Licence, support and responsibility
+
+MIT - see [LICENSE](LICENSE). The design is modelled on the Azure Landing Zones accelerator's bootstrap and
+pipeline templates (both MIT-licensed, github.com/Azure), without Azure Landing Zones in it. This is a
+community kit, not a Microsoft product, and comes with no support or warranty. It creates identities,
+role assignments, networks and pipelines: **read the plan before you type pply**, try it first in a lab
+subscription, and check the cost estimate it prints. Never put a token, a password or a state file in an
+issue or a pull request.

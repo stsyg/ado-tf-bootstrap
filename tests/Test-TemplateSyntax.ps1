@@ -139,7 +139,7 @@ if ($plan -notmatch '-detailed-exitcode') { Add-Issue "terraform plan must run w
 $shipped = Get-ChildItem -LiteralPath $KitRoot -Recurse -File -Force |
   Where-Object { $_.FullName -notmatch "\\(tests|\.terraform|output)\\" -and $_.Extension -in @(".tf", ".tftpl", ".yaml", ".md", ".ps1", ".psd1", ".hcl") -and $_.Name -notin @("README.md", ".terraform.lock.hcl", "tag-defaults.psd1") }
 foreach ($file in $shipped) {
-  $hit = Select-String -LiteralPath $file.FullName -Pattern "\balz\b|landing.zone|alz-mgmt|hydro ?one|\bh1\b" -SimpleMatch:$false | Select-Object -First 1
+  $hit = Select-String -LiteralPath $file.FullName -Pattern "\balz\b|landing.zone|alz-mgmt" -SimpleMatch:$false | Select-Object -First 1
   if ($hit) { Add-Issue "$($file.FullName.Substring($KitRoot.Length + 1)):$($hit.LineNumber) mentions something project-specific: $($hit.Line.Trim())" }
 }
 

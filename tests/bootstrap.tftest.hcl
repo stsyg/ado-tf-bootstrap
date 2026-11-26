@@ -18,14 +18,14 @@ mock_provider "azapi" {
 override_resource {
   target = azapi_resource.subnet_container_instances
   values = {
-    id = "/subscriptions/e1d19c4d-0000-4000-8000-000000000001/resourceGroups/rg-mock/providers/Microsoft.Network/virtualNetworks/vnet-mock/subnets/snet-aci"
+    id = "/subscriptions/aaaaaaaa-0000-4000-8000-000000000001/resourceGroups/rg-mock/providers/Microsoft.Network/virtualNetworks/vnet-mock/subnets/snet-aci"
   }
 }
 
 override_resource {
   target = azapi_resource.subnet_private_endpoints
   values = {
-    id = "/subscriptions/e1d19c4d-0000-4000-8000-000000000001/resourceGroups/rg-mock/providers/Microsoft.Network/virtualNetworks/vnet-mock/subnets/snet-pe"
+    id = "/subscriptions/aaaaaaaa-0000-4000-8000-000000000001/resourceGroups/rg-mock/providers/Microsoft.Network/virtualNetworks/vnet-mock/subnets/snet-pe"
   }
 }
 
@@ -34,7 +34,7 @@ variables {
   environment_name              = "lab"
   azure_location                = "canadacentral"
   location_short                = "cac"
-  bootstrap_subscription_id     = "e1d19c4d-0000-4000-8000-000000000001"
+  bootstrap_subscription_id     = "aaaaaaaa-0000-4000-8000-000000000001"
   azure_devops_organization_url = "https://dev.azure.com/contoso"
   azure_devops_project_name     = "Payments Platform"
   repository_name               = "payments-infra"
@@ -89,7 +89,7 @@ run "defaults_with_private_networking" {
     error_message = "By default the plan identity only reads the state container and the apply identity writes it."
   }
   assert {
-    condition     = azurerm_role_assignment.target["plan-subscription-e1d19c4d-0000-4000-8000-000000000001"].role_definition_name == "Reader" && azurerm_role_assignment.target["apply-subscription-e1d19c4d-0000-4000-8000-000000000001"].role_definition_name == "Contributor"
+    condition     = azurerm_role_assignment.target["plan-subscription-aaaaaaaa-0000-4000-8000-000000000001"].role_definition_name == "Reader" && azurerm_role_assignment.target["apply-subscription-aaaaaaaa-0000-4000-8000-000000000001"].role_definition_name == "Contributor"
     error_message = "Plan must be Reader and apply Contributor on the bootstrap subscription by default."
   }
 
@@ -179,7 +179,7 @@ run "defaults_with_private_networking" {
     error_message = "cd.yaml must name the connection, the pool and the templates repository."
   }
   assert {
-    condition     = strcontains(azuredevops_git_repository_file.main["terraform.tfvars"].content, "subscription_id = \"e1d19c4d-0000-4000-8000-000000000001\"") && strcontains(azuredevops_git_repository_file.main["terraform.tfvars"].content, "\"owner\" = \"platform-team\"") && strcontains(azuredevops_git_repository_file.main["terraform.tfvars"].content, "\"repository\" = \"dev.azure.com/contoso/Payments%20Platform/payments-infra\"")
+    condition     = strcontains(azuredevops_git_repository_file.main["terraform.tfvars"].content, "subscription_id = \"aaaaaaaa-0000-4000-8000-000000000001\"") && strcontains(azuredevops_git_repository_file.main["terraform.tfvars"].content, "\"owner\" = \"platform-team\"") && strcontains(azuredevops_git_repository_file.main["terraform.tfvars"].content, "\"repository\" = \"dev.azure.com/contoso/Payments%20Platform/payments-infra\"")
     error_message = "terraform.tfvars must carry the subscription and the tags."
   }
   assert {
@@ -548,7 +548,7 @@ run "no_nat_gateway_with_a_route_table_has_no_public_ip" {
 
   variables {
     use_nat_gateway      = false
-    agent_route_table_id = "/subscriptions/e1d19c4d-0000-4000-8000-000000000001/resourceGroups/rg-hub/providers/Microsoft.Network/routeTables/rt-egress"
+    agent_route_table_id = "/subscriptions/aaaaaaaa-0000-4000-8000-000000000001/resourceGroups/rg-hub/providers/Microsoft.Network/routeTables/rt-egress"
   }
 
   assert {
@@ -556,7 +556,7 @@ run "no_nat_gateway_with_a_route_table_has_no_public_ip" {
     error_message = "Where policy denies public IP addresses there must be no public IP and no NAT gateway."
   }
   assert {
-    condition     = azapi_resource.subnet_container_instances[0].body.properties.routeTable.id == "/subscriptions/e1d19c4d-0000-4000-8000-000000000001/resourceGroups/rg-hub/providers/Microsoft.Network/routeTables/rt-egress" && !can(azapi_resource.subnet_container_instances[0].body.properties.natGateway)
+    condition     = azapi_resource.subnet_container_instances[0].body.properties.routeTable.id == "/subscriptions/aaaaaaaa-0000-4000-8000-000000000001/resourceGroups/rg-hub/providers/Microsoft.Network/routeTables/rt-egress" && !can(azapi_resource.subnet_container_instances[0].body.properties.natGateway)
     error_message = "The agent subnet takes the route table, and no NAT gateway."
   }
   assert {
@@ -590,7 +590,7 @@ run "route_table_id_must_be_a_route_table" {
   command = plan
 
   variables {
-    agent_route_table_id = "/subscriptions/e1d19c4d-0000-4000-8000-000000000001/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/vnet"
+    agent_route_table_id = "/subscriptions/aaaaaaaa-0000-4000-8000-000000000001/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/vnet"
   }
 
   expect_failures = [var.agent_route_table_id]
@@ -634,7 +634,7 @@ run "management_group_and_several_subscriptions" {
   command = plan
 
   variables {
-    target_subscription_ids     = ["e1d19c4d-0000-4000-8000-000000000001", "d45813a0-0000-4000-8000-000000000002"]
+    target_subscription_ids     = ["aaaaaaaa-0000-4000-8000-000000000001", "bbbbbbbb-0000-4000-8000-000000000002"]
     target_management_group_ids = ["mg-platform"]
     apply_role_definition_name  = "Owner"
   }
