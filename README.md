@@ -1,16 +1,44 @@
-# project-bootstrap kit
+# ado-tf-bootstrap
 
-Answer a few questions, get the foundation a Terraform project needs - in Azure **and** Azure DevOps -
-without hand-building any of it, and without a connection to Azure Landing Zones or any other framework.
+**Bootstrap an Azure + Azure DevOps foundation for any Terraform project - answer a few questions, get remote state, passwordless pipelines, self-hosted agents and approvals.**
+
+## Overview
+
+Starting a Terraform project on Azure means the same hand-built groundwork every time: somewhere safe to
+keep the state, identities the pipelines can use without a secret, agents that can reach private
+resources, and a repository and pipelines that plan on every pull request and apply only after approval.
+This kit does that groundwork for you, once per project, from a PowerShell script and a Terraform root.
+
+You run one script and answer questions (project name, region, subscription, Azure DevOps organization,
+approvers, tags, agent size and cost). It writes the variables file from your answers, shows the plan, and
+- when you type `apply` - builds:
+
+- **In Azure:** a private, versioned Terraform state account; separate read-only *plan* and read-write
+  *apply* managed identities that sign in to Azure DevOps by OIDC (workload identity federation - no
+  client secret exists); role assignments on the scopes you name; and, optionally, self-hosted Azure
+  DevOps agents on Container Instances in a private network (registry, private endpoints, private DNS,
+  NAT gateway).
+- **In Azure DevOps:** the project, a main repository with a starter Terraform layout, a shared
+  pipeline-templates repository, branch policies, a CI pipeline (plan on every pull request) and a CD
+  pipeline (plan, then apply only if the plan has changes and an approver agrees), environments, service
+  connections with approval, branch-control, lock and required-template checks, a variable group, an
+  approvers group and an agent pool.
+- **Every resource tagged** to your organization's standard, up to Azure's limit of 15 tags, including a
+  `repository` tag filled in for you.
+
+The pipelines skip the apply when there is nothing to change, show the plan as a summary card on the run,
+and never apply from a workstation. It is generic: no Azure Landing Zones or other framework is involved,
+and nothing in it is specific to one organization. It is a **foundation**, not your infrastructure: what the
+project's Terraform builds afterwards is yours, changed by pull request through the two pipelines.
 
 ```pwsh
 .\New-ProjectBootstrap.ps1
 ```
 
-It asks for a project name, a region, a subscription, an Azure DevOps organization, the names of the
-repositories and pipelines, who approves - each with a default and a reason - writes the Terraform
-variables file from the answers, shows you the plan, and (when you type `apply`) builds everything. Run it
-again for the next project; run it again for the same project to change an answer.
+Run it again for the next project; run it again for the same project to change an answer. To use it in a
+project - clone, copy into the project's folder, bootstrap - go to
+[Use it for a project](#use-it-for-a-project-clone-copy-bootstrap). Everything it builds is listed under
+[What it builds](#what-it-builds).
 
 ## Use it for a project: clone, copy, bootstrap
 
