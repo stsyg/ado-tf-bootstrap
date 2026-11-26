@@ -1,8 +1,16 @@
-# ado-tf-bootstrap
+# Azure DevOps + Terraform Project Bootstrap
 
-**Bootstrap an Azure + Azure DevOps foundation for any Terraform project - answer a few questions, get remote state, passwordless pipelines, self-hosted agents and approvals.**
+**Set up a new Terraform project on Azure in minutes: answer a few questions and get remote state, passwordless pipelines, self-hosted build agents and approvals - already wired together.**
 
 ## Overview
+
+This kit is a simplified, general-purpose take on the bootstrap in the
+[Azure Landing Zones Terraform accelerator](https://github.com/Azure/alz-terraform-accelerator) (its Terraform
+modules live in [accelerator-bootstrap-modules](https://github.com/Azure/accelerator-bootstrap-modules)). The idea
+- one run that builds the state storage, the identities and the Azure DevOps project and pipelines a Terraform
+deployment needs - comes from there. Here it is cut down to serve **any** project that uses Azure DevOps and
+Terraform, with nothing about Azure Landing Zones in it. It is an independent community project, not part of
+the accelerator and not supported by Microsoft.
 
 Starting a Terraform project on Azure means the same hand-built groundwork every time: somewhere safe to
 keep the state, identities the pipelines can use without a secret, agents that can reach private
